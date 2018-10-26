@@ -1,1 +1,2 @@
 
+testkernelbuffer：验证的的的的的的的的Linux的内核缓存区大小为4KB；
