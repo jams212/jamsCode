@@ -1,0 +1,362 @@
+mport os, collections, time
+import numpy as np
+import tensorflow as tf
+from PIL import Image
+"""
+实现下面的方法就能采用分布式调用GPU实现训练模型
+"""
+
+NUM_CLASSES = 43
+BATCH_SIZE = 5  # 每批次训练集
+LEARNING_RATE_BASE = 0.001  # 基础学习率
+TRAINING_STEPS = 2000  # 训练总轮数
+SAVE_CHECKPOINT_SECS = 60  # 每隔60秒保存一次模型
+MOMENTUM = 0.9
+DATA_PATH = "./data/train_resize/"  # 数据集文件路径
+
+
+# 定义输入tensor结构，例如tf.placeholder(tf.float32, [None, mnist_inference.INPUT_NODE], name='x-input')
+X = tf.placeholder(tf.float32, [None, 224, 224, 3], name='x-input')
+
+# 定义标签tensor结构，例如tf.placeholder(tf.float32, [None, mnist_inference.OUTPUT_NODE], name='y-input')
+Y_ = tf.placeholder(tf.float32, [None, NUM_CLASSES], name='y-output')
+
+
+slim = tf.contrib.slim
+
+
+class Block(collections.namedtuple('Block', ['scope', 'unit_fn', 'args'])):
+    pass
+
+
+def subsample(inputs, factor, scope=None):
+  if factor == 1:
+    return inputs
+  else:
+    return slim.max_pool2d(inputs, [1, 1], stride=factor, scope=scope)
+
+
+def conv2d_same(inputs, num_outputs, kernel_size, stride, rate=1, scope=None):
+  if stride == 1:
+    return slim.conv2d(inputs, num_outputs, kernel_size, stride=1, rate=rate,
+                       padding='SAME', scope=scope)
+  else:
+    kernel_size_effective = kernel_size + (kernel_size - 1) * (rate - 1)
+    pad_total = kernel_size_effective - 1
+    pad_beg = pad_total // 2
+    pad_end = pad_total - pad_beg
+    inputs = tf.pad(inputs,
+                    [[0, 0], [pad_beg, pad_end], [pad_beg, pad_end], [0, 0]])
+    return slim.conv2d(inputs, num_outputs, kernel_size, stride=stride,
+                       rate=rate, padding='VALID', scope=scope)
+
+
+@slim.add_arg_scope
+def stack_blocks_dense(net, blocks, output_stride=None,
+                       store_non_strided_activations=False,
+                       outputs_collections=None):
+
+  current_stride = 1
+  rate = 1
+
+  for block in blocks:
+    with tf.variable_scope(block.scope, 'block', [net]) as sc:
+      block_stride = 1
+      for i, unit in enumerate(block.args):
+        if store_non_strided_activations and i == len(block.args) - 1:
+          block_stride = unit.get('stride', 1)
+          unit = dict(unit, stride=1)
+
+        with tf.variable_scope('unit_%d' % (i + 1), values=[net]):
+
+          if output_stride is not None and current_stride == output_stride:
+            net = block.unit_fn(net, rate=rate, **dict(unit, stride=1))
+            rate *= unit.get('stride', 1)
+
+          else:
+            net = block.unit_fn(net, rate=1, **unit)
+            current_stride *= unit.get('stride', 1)
+            if output_stride is not None and current_stride > output_stride:
+              raise ValueError('The target output_stride cannot be reached.')
+
+      net = slim.utils.collect_named_outputs(outputs_collections, sc.name, net)
+
+      if output_stride is not None and current_stride == output_stride:
+        rate *= block_stride
+      else:
+        net = subsample(net, block_stride)
+        current_stride *= block_stride
+        if output_stride is not None and current_stride > output_stride:
+          raise ValueError('The target output_stride cannot be reached.')
+
+  if output_stride is not None and current_stride != output_stride:
+    raise ValueError('The target output_stride cannot be reached.')
+
+  return net
+
+
+def resnet_arg_scope(weight_decay=0.0001,
+                     batch_norm_decay=0.997,
+                     batch_norm_epsilon=1e-5,
+                     batch_norm_scale=True,
+                     activation_fn=tf.nn.relu,
+                     use_batch_norm=True,
+                     batch_norm_updates_collections=tf.GraphKeys.UPDATE_OPS):
+
+  batch_norm_params = {
+      'decay': batch_norm_decay,
+      'epsilon': batch_norm_epsilon,
+      'scale': batch_norm_scale,
+      'updates_collections': batch_norm_updates_collections,
+      'fused': None,
+  }
+
+  with slim.arg_scope(
+      [slim.conv2d],
+      weights_regularizer=slim.l2_regularizer(weight_decay),
+      weights_initializer=slim.variance_scaling_initializer(),
+      activation_fn=activation_fn,
+      normalizer_fn=slim.batch_norm if use_batch_norm else None,
+      normalizer_params=batch_norm_params):
+    with slim.arg_scope([slim.batch_norm], **batch_norm_params):
+
+      with slim.arg_scope([slim.max_pool2d], padding='SAME') as arg_sc:
+        return arg_sc
+
+@slim.add_arg_scope
+def bottleneck(inputs, depth, depth_bottleneck, stride, rate=1,
+               outputs_collections=None, scope=None):
+
+  with tf.variable_scope(scope, 'bottleneck_v2', [inputs]) as sc:
+    depth_in = slim.utils.last_dimension(inputs.get_shape(), min_rank=4)
+    preact = slim.batch_norm(inputs, activation_fn=tf.nn.relu, scope='preact')
+    if depth == depth_in:
+      shortcut = subsample(inputs, stride, 'shortcut')
+    else:
+      shortcut = slim.conv2d(preact, depth, [1, 1], stride=stride,
+                             normalizer_fn=None, activation_fn=None,
+                             scope='shortcut')
+
+    residual = slim.conv2d(preact, depth_bottleneck, [1, 1], stride=1,
+                           scope='conv1')
+    residual = conv2d_same(residual, depth_bottleneck, 3, stride,
+                                        rate=rate, scope='conv2')
+    residual = slim.conv2d(residual, depth, [1, 1], stride=1,
+                           normalizer_fn=None, activation_fn=None,
+                           scope='conv3')
+
+    output = shortcut + residual
+
+    return slim.utils.collect_named_outputs(outputs_collections,
+                                            sc.name,
+                                            output)
+
+
+def resnet_v2(inputs,
+              labels,
+              blocks,
+              num_classes=None,
+              is_training=True,
+              global_pool=True,
+              output_stride=None,
+              include_root_block=True,
+              spatial_squeeze=True,
+              reuse=None,
+              scope=None):
+
+  with tf.variable_scope(scope, 'resnet_v2', [inputs], reuse=reuse) as sc:
+    end_points_collection = sc.original_name_scope + '_end_points'
+    with slim.arg_scope([slim.conv2d, bottleneck, stack_blocks_dense],
+                        outputs_collections=end_points_collection):
+      with slim.arg_scope([slim.batch_norm], is_training=is_training):
+        net = inputs
+        if include_root_block:
+          if output_stride is not None:
+            if output_stride % 4 != 0:
+              raise ValueError('The output_stride needs to be a multiple of 4.')
+            output_stride /= 4
+
+          with slim.arg_scope([slim.conv2d],
+                              activation_fn=None, normalizer_fn=None):
+            net = conv2d_same(net, 64, 7, stride=2, scope='conv1')
+          net = slim.max_pool2d(net, [3, 3], stride=2, scope='pool1')
+        net = stack_blocks_dense(net, blocks, output_stride)
+
+        net = slim.batch_norm(net, activation_fn=tf.nn.relu, scope='postnorm')
+        end_points = slim.utils.convert_collection_to_dict(
+            end_points_collection)
+
+        if global_pool:
+          net = tf.reduce_mean(net, [1, 2], name='pool5', keep_dims=True)
+          end_points['global_pool'] = net
+        if num_classes:
+          net = slim.conv2d(net, num_classes, [1, 1], activation_fn=None,
+                            normalizer_fn=None, scope='logits')
+          end_points[sc.name + '/logits'] = net
+          if spatial_squeeze:
+            net = tf.squeeze(net, [1, 2], name='SpatialSqueeze')
+            end_points[sc.name + '/spatial_squeeze'] = net
+          end_points['predictions'] = slim.softmax(net, scope='predictions')
+          logits = end_points[sc.name + '/logits']
+          cross_entropy_mean = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=logits, labels=labels))
+          regularization_losses = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+          loss_ = tf.add_n([cross_entropy_mean] + regularization_losses)
+          pred = tf.argmax(end_points['predictions'], 1)
+        return net, pred, loss_
+
+
+def resnet_v2_block(scope, base_depth, num_units, stride):
+
+  return Block(scope, bottleneck, [{
+      'depth': base_depth * 4,
+      'depth_bottleneck': base_depth,
+      'stride': 1
+  }] * (num_units - 1) + [{
+      'depth': base_depth * 4,
+      'depth_bottleneck': base_depth,
+      'stride': stride
+  }])
+
+
+def resnet_v2_50(inputs,
+                 labels,
+                 num_classes=None,
+                 is_training=True,
+                 global_pool=True,
+                 output_stride=None,
+                 spatial_squeeze=True,
+                 reuse=None,
+                 scope='resnet_v2_50'):
+  blocks = [
+      resnet_v2_block('block1', base_depth=64, num_units=3, stride=2),
+      resnet_v2_block('block2', base_depth=128, num_units=4, stride=2),
+      resnet_v2_block('block3', base_depth=256, num_units=6, stride=2),
+      resnet_v2_block('block4', base_depth=512, num_units=3, stride=1),
+  ]
+  return resnet_v2(inputs, blocks, num_classes, is_training=is_training,
+                   global_pool=global_pool, output_stride=output_stride,
+                   include_root_block=True, spatial_squeeze=spatial_squeeze,
+                   reuse=reuse, scope=scope)
+
+
+def resnet_v2_101(inputs,
+                  labels,
+                  num_classes=None,
+                  is_training=True,
+                  global_pool=True,
+                  output_stride=None,
+                  spatial_squeeze=True,
+                  reuse=None,
+                  scope='resnet_v2_101'):
+  blocks = [
+      resnet_v2_block('block1', base_depth=64, num_units=3, stride=2),
+      resnet_v2_block('block2', base_depth=128, num_units=4, stride=2),
+      resnet_v2_block('block3', base_depth=256, num_units=23, stride=2),
+      resnet_v2_block('block4', base_depth=512, num_units=3, stride=1),
+  ]
+  return resnet_v2(inputs, blocks, num_classes, is_training=is_training,
+                   global_pool=global_pool, output_stride=output_stride,
+                   include_root_block=True, spatial_squeeze=spatial_squeeze,
+                   reuse=reuse, scope=scope)
+
+
+def resnet_v2_152(inputs,
+                  labels,
+                  num_classes=None,
+                  is_training=True,
+                  global_pool=True,
+                  output_stride=None,
+                  spatial_squeeze=True,
+                  reuse=None,
+                  scope='resnet_v2_152'):
+  blocks = [
+      resnet_v2_block('block1', base_depth=64, num_units=3, stride=2),
+      resnet_v2_block('block2', base_depth=128, num_units=8, stride=2),
+      resnet_v2_block('block3', base_depth=256, num_units=36, stride=2),
+      resnet_v2_block('block4', base_depth=512, num_units=3, stride=1),
+  ]
+  return resnet_v2(inputs, blocks, num_classes, is_training=is_training,
+                   global_pool=global_pool, output_stride=output_stride,
+                   include_root_block=True, spatial_squeeze=spatial_squeeze,
+                   reuse=reuse, scope=scope)
+
+
+def resnet_v2_200(inputs,
+                  labels,
+                  num_classes=None,
+                  is_training=True,
+                  global_pool=True,
+                  output_stride=None,
+                  spatial_squeeze=True,
+                  reuse=None,
+                  scope='resnet_v2_200'):
+  blocks = [
+      resnet_v2_block('block1', base_depth=64, num_units=3, stride=2),
+      resnet_v2_block('block2', base_depth=128, num_units=24, stride=2),
+      resnet_v2_block('block3', base_depth=256, num_units=36, stride=2),
+      resnet_v2_block('block4', base_depth=512, num_units=3, stride=1),
+  ]
+  return resnet_v2(inputs, labels, blocks, num_classes, is_training=is_training,
+                   global_pool=global_pool, output_stride=output_stride,
+                   include_root_block=True, spatial_squeeze=spatial_squeeze,
+                   reuse=reuse, scope=scope)
+
+
+def next_batch(step):
+    files = os.listdir(DATA_PATH)
+    batch_xs = []  # 用于保存X类型的数据集
+    batch_ys = []  # 用于保存Y_类型的数据集
+    batch_index = step % int((len(files)/BATCH_SIZE))
+    for i in range(BATCH_SIZE):
+        index = BATCH_SIZE*batch_index + i
+        img = Image.open(DATA_PATH+files[index])
+        img_resize = img.resize((224, 224), Image.ANTIALIAS)
+        img_ndarray = np.asarray(img_resize, dtype='float32')
+        img_ndarray = np.reshape(img_ndarray, [224, 224, 3])
+        batch_x = img_ndarray
+        batch_xs.append(batch_x)
+        cat = files[index].split('_')[0]
+        batch_y = np.zeros((1, 43))[0]
+        batch_y[int(cat)] = 1
+        batch_y = np.reshape(batch_y, [43, ])
+        batch_ys.append(batch_y)
+    return batch_xs, batch_ys
+
+
+global global_step
+global loss
+global train_op
+global accuracy
+start_time = time.time()
+
+
+# 实现创建模型接口，在这里，我们没有用到传入的参数is_chief（代表是否是分布式中的主节点）
+def build_model(is_chief):
+    global global_step
+    global loss
+    global train_op
+    global accuracy
+    global_step = tf.Variable(0, name="global_step", trainable=False)  # 创建全局global_step，必写
+    net, pred, loss = resnet_v2_200(X, Y_, NUM_CLASSES)
+    opt = tf.train.MomentumOptimizer(LEARNING_RATE_BASE, MOMENTUM)
+    grads = opt.compute_gradients(loss)
+    train_op = opt.apply_gradients(grads, global_step=global_step)
+    correct_pred = tf.equal(pred, tf.argmax(Y_, 1))
+
+    # 如果不用accuracy，可以将accuracy定义为None，但是accuracy必须定义
+    accuracy = tf.reduce_mean(tf.cast(correct_pred, tf.float32))
+
+
+# 实现训练接口，step是本地的step数，每调用一次train_model函数，该step会+1
+def train_model(session, step):
+    global global_step
+    global loss
+    global train_op
+    global accuracy
+
+    xs, ys = next_batch(step)
+    _, loss_value, global_step_value, acc = session.run([train_op, loss, global_step, accuracy],feed_dict={X: xs, Y_: ys})
+    if step % 1 == 0:
+        current_info = "After %s seconds training,loss is %s,global_step is %s,acc is %s" % (
+        (time.time() - start_time), loss_value, global_step_value, acc)
+        yield current_info  # 用yield传出需要打印的信息
